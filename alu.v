@@ -1,35 +1,49 @@
 `timescale 1ns / 1ps
 
 module alu (
-    input  wire signed [7:0] A,      // 8-bit 有號數 (-99 ~ +99)
-    input  wire signed [7:0] B,      // 8-bit 有號數 (-99 ~ +99)
-    input  wire [1:0] op,            // 運算碼 (00:+, 01:-, 10:*, 11:/)
-    output reg  signed [14:0] res,   // 15-bit 運算結果 (-16384 ~ +16383)
-    output reg  error                // 除零錯誤旗標
+    input  wire signed [31:0] val_A,
+    input  wire signed [31:0] val_B,
+    input  wire [3:0] op_sel,
+    output reg  signed [31:0] val_Res,
+    output reg  err,
+    output reg  [7:0] dp_ctrl
 );
 
-    always @(*) begin
-        // 預設值 (防止 Latch)
-        res = 15'sd0; 
-        error = 1'b0;
+    reg [31:0] uA, uB, uRes;
 
-        case (op)
-            2'b00: res = A + B;
-            2'b01: res = A - B;
-            2'b10: res = A * B;
-            2'b11: begin
-                if (B == 8'sd0) begin
-                    error = 1'b1;
-                    res = 15'sd0;
+    always @(*) begin
+        err = 0;
+        val_Res = 0;
+        dp_ctrl = 8'b0000_0000;
+
+        case (op_sel)
+            4'b1000: begin 
+                val_Res = val_A + val_B; 
+                dp_ctrl = 8'b0000_0010; 
+            end
+            4'b0100: begin 
+                val_Res = val_A - val_B; 
+                dp_ctrl = 8'b0000_0010; 
+            end
+            4'b0010: begin 
+                val_Res = (val_A * val_B) / 10; 
+                dp_ctrl = 8'b0000_0010; 
+            end
+            4'b0001: begin
+                if (val_B == 0) begin
+                    err = 1;
                 end else begin
-                    res = A / B;
+                    // Handle signed division by resolving absolute magnitudes first
+                    uA = (val_A < 0) ? -val_A : val_A;
+                    uB = (val_B < 0) ? -val_B : val_B;
+                    uRes = (uA * 1000) / uB;
+                    val_Res = ((val_A < 0) ^ (val_B < 0)) ? -uRes : uRes;
                 end
+                dp_ctrl = 8'b0000_1000; 
             end
             default: begin
-                res = 15'sd0;
-                error = 1'b0;
+                err = 1; 
             end
         endcase
     end
-
 endmodule

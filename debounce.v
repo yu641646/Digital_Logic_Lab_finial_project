@@ -1,46 +1,28 @@
 `timescale 1ns / 1ps
 
 module debounce (
-    input  wire clk, rst_n, btn_in,
-    output wire btn_pulse
+    input  wire clk,
+    input  wire rst,
+    input  wire btn_in,
+    output wire pulse
 );
+    reg [19:0] cnt;
+    reg d1, d2, state, state_d;
 
-    // 1. 雙層同步暫存器 (消除亞穩態)
-    reg btn_ff1, btn_ff2;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            btn_ff1 <= 1'b0; btn_ff2 <= 1'b0;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin 
+            cnt <= 0; d1 <= 0; d2 <= 0; state <= 0; state_d <= 0; 
         end else begin
-            btn_ff1 <= btn_in; btn_ff2 <= btn_ff1;
+            d1 <= btn_in; 
+            d2 <= d1;
+            
+            if (d1 == d2) cnt <= cnt + 1; 
+            else cnt <= 0;
+            
+            if (cnt == 20'd1_000_000) state <= d2;
+            state_d <= state;
         end
     end
 
-    // 2. 防彈跳計數器 (20ms)
-    reg [20:0] count;
-    reg btn_stable; 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            count <= 21'd0; btn_stable <= 1'b0;
-        end else begin
-            if (btn_ff2 != btn_stable) begin
-                count <= count + 1'b1;
-                if (count == 21'd2_000_000) begin  
-                    btn_stable <= btn_ff2;
-                    count <= 21'd0;
-                end
-            end else begin
-                count <= 21'd0;
-            end
-        end
-    end
-
-    // 3. 正緣觸發 (產生單步脈衝)
-    reg btn_stable_delay;
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) btn_stable_delay <= 1'b0;
-        else        btn_stable_delay <= btn_stable;
-    end
-
-    assign btn_pulse = btn_stable & (~btn_stable_delay);
-
+    assign pulse = state & ~state_d;
 endmodule

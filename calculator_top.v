@@ -1,117 +1,171 @@
 `timescale 1ns / 1ps
 
-module calculator_top(
-    input  wire clk,                 
-    input  wire rst_n,               
-    
-    // 5 個實體按鍵 (十字方向與確認)
-    input  wire btn_center, 
-    input  wire btn_up,     
-    input  wire btn_down,   
-    input  wire btn_left,   
-    input  wire btn_right,  
-    
-    // 指撥開關: [7:6]=OP, [5]=B符號, [4]=A符號
-    input  wire [7:0] sw,   
-    
+module calculator_top (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire btn_left,
+    input  wire btn_right,
+    input  wire btn_up,
+    input  wire btn_down,
+    input  wire btn_exec,
+    input  wire [7:0] sw,
     output wire [7:0] anode,
     output wire [7:0] seg_left,
     output wire [7:0] seg_right
 );
 
-    // --- 1. 按鍵防彈跳 (Debounce) ---
-    wire pulse_center, pulse_up, pulse_down, pulse_left, pulse_right;
-    
-    debounce u_db_center (.clk(clk), .rst_n(rst_n), .btn_in(btn_center), .btn_pulse(pulse_center));
-    debounce u_db_up     (.clk(clk), .rst_n(rst_n), .btn_in(btn_up),     .btn_pulse(pulse_up));
-    debounce u_db_down   (.clk(clk), .rst_n(rst_n), .btn_in(btn_down),   .btn_pulse(pulse_down));
-    debounce u_db_left   (.clk(clk), .rst_n(rst_n), .btn_in(btn_left),   .btn_pulse(pulse_left));
-    debounce u_db_right  (.clk(clk), .rst_n(rst_n), .btn_in(btn_right),  .btn_pulse(pulse_right));
+    wire rst = ~rst_n;
 
-    // --- 2. 輸入介面 (BCD 計數與二進位轉換) ---
-    wire [3:0] a_ten, a_one, b_ten, b_one;
-    wire a_sign = sw[4];
-    wire b_sign = sw[5];
-    
-    bcd_counter u_counter (
-        .clk(clk), .rst_n(rst_n),
-        .btn_up_pulse(pulse_up), .btn_down_pulse(pulse_down),
-        .btn_left_pulse(pulse_left), .btn_right_pulse(pulse_right),
-        .A_ten(a_ten), .A_one(a_one), .B_ten(b_ten), .B_one(b_one)
+    // --- Debounce Instantiation ---
+    wire p_l, p_r, p_u, p_d, p_e;
+    debounce dl (.clk(clk), .rst(rst), .btn_in(btn_left),  .pulse(p_l));
+    debounce dr (.clk(clk), .rst(rst), .btn_in(btn_right), .pulse(p_r));
+    debounce du (.clk(clk), .rst(rst), .btn_in(btn_up),    .pulse(p_u));
+    debounce dd (.clk(clk), .rst(rst), .btn_in(btn_down),  .pulse(p_d));
+    debounce de (.clk(clk), .rst(rst), .btn_in(btn_exec),  .pulse(p_e));
+
+    // --- Core Registers ---
+    reg [3:0] D [0:7];       
+    reg [3:0] R [0:7];       
+    reg [2:0] cursor;        
+    reg show_result;         
+    reg [7:0] dp_ctrl;       
+    reg err;                 
+
+    // Parse Input Values
+    wire signed [31:0] val_A = (D[7]==4'hA ? -1 : 1) * (D[6]*100 + D[5]*10 + D[4]);
+    wire signed [31:0] val_B = (D[3]==4'hA ? -1 : 1) * (D[2]*100 + D[1]*10 + D[0]);
+    wire [3:0] op_sel = { (sw[7]|sw[6]), (sw[5]|sw[4]), (sw[3]|sw[2]), (sw[1]|sw[0]) };
+
+    // ALU Connections
+    wire signed [31:0] alu_res;
+    wire alu_err;
+    wire [7:0] alu_dp;
+
+    alu alu_inst (
+        .val_A(val_A),
+        .val_B(val_B),
+        .op_sel(op_sel),
+        .val_Res(alu_res),
+        .err(alu_err),
+        .dp_ctrl(alu_dp)
     );
 
-    wire signed [7:0] bin_A_curr, bin_B_curr;
-    bcd_to_bin u_b2b_A (.ten(a_ten), .one(a_one), .sign(a_sign), .bin_out(bin_A_curr));
-    bcd_to_bin u_b2b_B (.ten(b_ten), .one(b_one), .sign(b_sign), .bin_out(bin_B_curr));
+    // --- Main State Machine ---
+    reg [3:0] state;
+    reg [31:0] abs_res;
+    integer i;
 
-    // --- 3. 狀態機與資料鎖存 (FSM & Datapath) ---
-    localparam S_INPUT   = 1'b0;
-    localparam S_DISPLAY = 1'b1;
-    reg current_state, next_state;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= 0; show_result <= 0; cursor <= 7;
+            for(i=0; i<8; i=i+1) D[i] <= 0;
+        end else begin
+            case(state)
+                0: begin // State 0: Input and Cursor Control
+                    show_result <= 0;
+                    dp_ctrl <= 8'b0010_0010; 
+                    
+                    if (p_l) cursor <= (cursor == 7) ? 0 : cursor + 1;
+                    if (p_r) cursor <= (cursor == 0) ? 7 : cursor - 1;
+                    
+                    if (p_u) begin
+                        if (cursor==7 || cursor==3) D[cursor] <= (D[cursor]==4'hA) ? 0 : 4'hA;
+                        else D[cursor] <= (D[cursor]==9) ? 0 : D[cursor]+1;
+                    end
+                    if (p_d) begin
+                        if (cursor==7 || cursor==3) D[cursor] <= (D[cursor]==4'hA) ? 0 : 4'hA;
+                        else D[cursor] <= (D[cursor]==0) ? 9 : D[cursor]-1;
+                    end
+                    
+                    if (p_e) state <= 1; 
+                end
 
-    reg signed [7:0] reg_A, reg_B;
-    reg [1:0] reg_op;
+                1: begin // State 1: Arithmetic Execution
+                    err <= alu_err;
+                    dp_ctrl <= alu_dp;
+                    state <= 2;
+                end
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) current_state <= S_INPUT;
-        else        current_state <= next_state;
-    end
+                2: begin // State 2: Absolute Value
+                    abs_res <= (alu_res < 0) ? -alu_res : alu_res;
+                    state <= 3;
+                end
 
-    always @(*) begin
-        next_state = current_state;
-        if (pulse_center) begin
-            case (current_state)
-                S_INPUT:   next_state = S_DISPLAY;
-                S_DISPLAY: next_state = S_INPUT;
+                3: begin // State 3: BCD Extraction (Low)
+                    R[0] <= abs_res % 10;
+                    R[1] <= (abs_res / 10) % 10;
+                    R[2] <= (abs_res / 100) % 10;
+                    R[3] <= (abs_res / 1000) % 10;
+                    state <= 4;
+                end
+
+                4: begin // State 4: BCD Extraction (High)
+                    R[4] <= (abs_res / 10000) % 10;
+                    R[5] <= (abs_res / 100000) % 10;
+                    R[6] <= (abs_res / 1000000) % 10;
+                    R[7] <= 4'hB; 
+                    state <= 5;
+                end
+
+                5: begin // State 5: Dynamic Zero Blanking
+                    if (op_sel == 4'b0001) begin 
+                        if (R[6]==0) begin R[6]<=4'hB;
+                            if (R[5]==0) begin R[5]<=4'hB;
+                                if (R[4]==0) begin R[4]<=4'hB; end
+                            end
+                        end
+                    end else begin 
+                        if (R[6]==0) begin R[6]<=4'hB;
+                            if (R[5]==0) begin R[5]<=4'hB;
+                                if (R[4]==0) begin R[4]<=4'hB;
+                                    if (R[3]==0) begin R[3]<=4'hB;
+                                        if (R[2]==0) begin R[2]<=4'hB; end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    state <= 6;
+                end
+
+                6: begin // State 6: Floating Sign and Error Handling
+                    if (err) begin
+                        R[7]<=4'hB; R[6]<=4'hB; R[5]<=4'hB; R[4]<=4'hB;
+                        R[3]<=4'hB; R[2]<=4'hB; R[1]<=4'hB; R[0]<=4'hE;
+                        dp_ctrl <= 8'b0000_0000;
+                    end else if (alu_res < 0) begin
+                        if      (R[6]==4'hB) R[6]<=4'hA;
+                        else if (R[5]==4'hB) R[5]<=4'hA;
+                        else if (R[4]==4'hB) R[4]<=4'hA;
+                        else if (R[3]==4'hB && op_sel!=4'b0001) R[3]<=4'hA;
+                        else if (R[2]==4'hB && op_sel!=4'b0001) R[2]<=4'hA;
+                    end
+                    state <= 7;
+                end
+
+                7: begin // State 7: Display Result
+                    show_result <= 1;
+                    if (p_e) state <= 0; 
+                end
             endcase
         end
     end
 
-    // 於輸入狀態按下確認鍵時，鎖存當下數值供 ALU 運算
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            reg_A  <= 8'sd0;
-            reg_B  <= 8'sd0;
-            reg_op <= 2'b00;
-        end else if (current_state == S_INPUT && pulse_center) begin
-            reg_A  <= bin_A_curr;
-            reg_B  <= bin_B_curr;
-            reg_op <= sw[7:6];
-        end
-    end
+    // --- Display Module Instantiation ---
+    wire [31:0] flat_D = {D[7], D[6], D[5], D[4], D[3], D[2], D[1], D[0]};
+    wire [31:0] flat_R = {R[7], R[6], R[5], R[4], R[3], R[2], R[1], R[0]};
 
-    // --- 4. 算術運算與 BCD 解碼 (ALU & Double Dabble) ---
-    wire signed [14:0] calc_res;
-    wire alu_error;
-
-    alu u_alu (
-        .A(reg_A), .B(reg_B), .op(reg_op),
-        .res(calc_res), .error(alu_error)
+    seg_display disp_inst (
+        .clk(clk),
+        .flat_D(flat_D),
+        .flat_R(flat_R),
+        .cursor(cursor),
+        .show_result(show_result),
+        .dp_ctrl(dp_ctrl),
+        .anode(anode),
+        .seg_left(seg_left),
+        .seg_right(seg_right)
     );
-
-    // 擷取 15-bit 結果的符號與絕對值
-    wire is_neg = calc_res[14]; 
-    wire [14:0] abs_res = is_neg ? (~calc_res + 1'b1) : calc_res;
-    
-    wire [3:0] bcd_tho, bcd_hun, bcd_ten, bcd_one;
-    bcd_converter u_bcd (
-        .bin_in(abs_res), 
-        .bcd_tho(bcd_tho), .bcd_hun(bcd_hun), .bcd_ten(bcd_ten), .bcd_one(bcd_one)
-    );
-
-    // --- 5. 動態掃描顯示多工器 ---
-    seg_display u_seg (
-        .clk(clk), .rst_n(rst_n),
-        .current_state(current_state),
-        .A_sign(a_sign), .A_ten(a_ten), .A_one(a_one),
-        .B_sign(b_sign), .B_ten(b_ten), .B_one(b_one),
-        .res_sign(is_neg),
-        .res_tho(bcd_tho), .res_hun(bcd_hun), .res_ten(bcd_ten), .res_one(bcd_one),
-        .error_flag(alu_error),
-        .anode(anode), .seg_data(seg_left)
-    );
-
-    // EGO1 左右側並聯
-    assign seg_right = seg_left;
 
 endmodule
