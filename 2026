@@ -1,0 +1,429 @@
+`timescale 1ns / 1ps
+
+// ===================================================================
+// 1. ALU Core Module (內建順序型 BCD 轉換、動態小數點、除法修復)
+// ===================================================================
+module alu_core (
+    input  wire clk, rst, start,
+    input  wire [7:0] sw,        
+    input  wire [31:0] digits_in,
+    output reg  [31:0] ans_digits,
+    output reg  [2:0]  dp_pos,    // 動態小數點位置
+    output reg  overflow
+);
+    parameter S_IDLE      = 3'd0;
+    parameter S_PARSE     = 3'd1; 
+    parameter S_CALC      = 3'd2; 
+    parameter S_BCD_INIT  = 3'd3;
+    parameter S_BCD_SHIFT = 3'd4;
+    parameter S_FMT       = 3'd5; 
+
+    reg [2:0] state;
+    
+    wire [3:0] d0 = digits_in[31:28]; 
+    wire [3:0] d1 = digits_in[27:24]; 
+    wire [3:0] d2 = digits_in[23:20]; 
+    wire [3:0] d3 = digits_in[19:16]; 
+    wire [3:0] d4 = digits_in[15:12]; 
+    wire [3:0] d5 = digits_in[11:8];  
+    wire [3:0] d6 = digits_in[7:4];   
+    wire [3:0] d7 = digits_in[3:0];   
+
+    reg signed [31:0] val_A, val_B, val_Res;
+    wire [31:0] abs_res = (val_Res < 0) ? -val_Res : val_Res;
+
+    integer temp_A, temp_B;
+    reg z1, z2, z3, z4, z5;
+    reg [3:0] v0, v1, v2, v3, v4, v5;
+
+    // 開關聯集邏輯
+    wire is_add = sw[7] | sw[6];
+    wire is_sub = sw[5] | sw[4];
+    wire is_mul = sw[3] | sw[2];
+    wire is_div = sw[1] | sw[0];
+    wire [3:0] op_sel = {is_add, is_sub, is_mul, is_div};
+
+    // BCD 轉換暫存器
+    reg [19:0] bin_val;
+    reg [23:0] bcd_val;
+    reg [4:0]  shift_cnt;
+    reg [3:0] b0, b1, b2, b3, b4, b5;
+
+    always @(*) begin
+        temp_A = d1 * 100 + d2 * 10 + d3;
+        temp_B = d5 * 100 + d6 * 10 + d7;
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= S_IDLE;
+            ans_digits <= 32'hBBBBBBBB; 
+            dp_pos <= 3'd6;
+            overflow <= 1'b0;
+            val_A <= 0; val_B <= 0; val_Res <= 0;
+        end else begin
+            case (state)
+                S_IDLE: if (start) state <= S_PARSE;
+                
+                S_PARSE: begin
+                    val_A <= (d0 == 4'hA) ? -temp_A : temp_A;
+                    val_B <= (d4 == 4'hA) ? -temp_B : temp_B;
+                    state <= S_CALC;
+                end
+                
+                S_CALC: begin
+                    case (op_sel)
+                        4'b1000: begin // 加法
+                            val_Res <= val_A + val_B;
+                            dp_pos <= 3'd6; // 1位小數
+                            overflow <= 1'b0;
+                        end
+                        4'b0100: begin // 減法
+                            val_Res <= val_A - val_B;
+                            dp_pos <= 3'd6; // 1位小數
+                            overflow <= 1'b0;
+                        end
+                        4'b0010: begin // 乘法
+                            val_Res <= (val_A * val_B) / 10;
+                            dp_pos <= 3'd6; // 1位小數
+                            overflow <= 1'b0;
+                        end
+                        4'b0001: begin // 除法
+                            if (val_B == 0) begin
+                                val_Res <= 0; overflow <= 1'b1;
+                            end else begin
+                                // 💡 除法終極修復：拔掉負號純數字除，放大 1000 倍獲得 3 位小數！
+                                begin : DIV_LOGIC
+                                    reg [31:0] uA, uB, uRes;
+                                    reg sign_div;
+                                    uA = (val_A < 0) ? -val_A : val_A;
+                                    uB = (val_B < 0) ? -val_B : val_B;
+                                    sign_div = (val_A < 0) ^ (val_B < 0);
+                                    uRes = (uA * 1000) / uB;
+                                    val_Res <= sign_div ? -$signed(uRes) : $signed(uRes);
+                                    dp_pos <= 3'd4; // 3位小數
+                                    overflow <= 1'b0;
+                                end
+                            end
+                        end
+                        default: begin // 防呆：多個運算同時拉
+                            val_Res <= 0; overflow <= 1'b1;
+                        end
+                    endcase
+                    state <= S_BCD_INIT;
+                end
+
+                // 💡 完美的順序型 BCD 轉換，徹底解決亂碼與時序崩潰
+                S_BCD_INIT: begin
+                    if (overflow || abs_res > 999999) begin
+                        overflow <= 1'b1;
+                        ans_digits <= 32'hEEEEEEEE;
+                        state <= S_IDLE;
+                    end else begin
+                        bin_val <= abs_res[19:0];
+                        bcd_val <= 24'd0;
+                        shift_cnt <= 5'd0;
+                        state <= S_BCD_SHIFT;
+                    end
+                end
+
+                S_BCD_SHIFT: begin
+                    if (shift_cnt == 20) begin
+                        state <= S_FMT;
+                    end else begin
+                        b0 = bcd_val[3:0];   if (b0 >= 5) b0 = b0 + 3;
+                        b1 = bcd_val[7:4];   if (b1 >= 5) b1 = b1 + 3;
+                        b2 = bcd_val[11:8];  if (b2 >= 5) b2 = b2 + 3;
+                        b3 = bcd_val[15:12]; if (b3 >= 5) b3 = b3 + 3;
+                        b4 = bcd_val[19:16]; if (b4 >= 5) b4 = b4 + 3;
+                        b5 = bcd_val[23:20]; if (b5 >= 5) b5 = b5 + 3;
+
+                        bcd_val <= {b5[2:0], b4, b3, b2, b1, b0, bin_val[19]};
+                        bin_val <= bin_val << 1;
+                        shift_cnt <= shift_cnt + 1;
+                    end
+                end
+
+                S_FMT: begin
+                    v0 = bcd_val[3:0];  v1 = bcd_val[7:4];  v2 = bcd_val[11:8];
+                    v3 = bcd_val[15:12];v4 = bcd_val[19:16];v5 = bcd_val[23:20];
+
+                    if (dp_pos == 3'd4) begin
+                        z1 = 1'b1; z2 = 1'b1; z3 = 1'b1; // 除法 3位小數必定顯示
+                        z4 = (abs_res >= 10000);
+                        z5 = (abs_res >= 100000);
+                    end else begin
+                        z1 = 1'b1;                       // 其他 1位小數必定顯示
+                        z2 = (abs_res >= 100);
+                        z3 = (abs_res >= 1000);
+                        z4 = (abs_res >= 10000);
+                        z5 = (abs_res >= 100000);
+                    end
+
+                    ans_digits <= 32'hBBBBBBBB;
+                    ans_digits[3:0]   <= v0;
+                    ans_digits[7:4]   <= z1 ? v1 : 4'hB;
+                    ans_digits[11:8]  <= z2 ? v2 : 4'hB;
+                    ans_digits[15:12] <= z3 ? v3 : 4'hB;
+                    ans_digits[19:16] <= z4 ? v4 : 4'hB;
+                    ans_digits[23:20] <= z5 ? v5 : 4'hB;
+
+                    // 浮動正負號精準貼齊
+                    if (val_Res < 0) begin
+                        if      (!z1) ans_digits[7:4]   <= 4'hA;
+                        else if (!z2) ans_digits[11:8]  <= 4'hA;
+                        else if (!z3) ans_digits[15:12] <= 4'hA;
+                        else if (!z4) ans_digits[19:16] <= 4'hA;
+                        else if (!z5) ans_digits[23:20] <= 4'hA;
+                        else          ans_digits[27:24] <= 4'hA;
+                    end
+                    state <= S_IDLE; 
+                end
+                default: state <= S_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+// ===================================================================
+// 2. 7-Segment Display Module
+// ===================================================================
+module seg_display (
+    input  wire clk, rst,
+    input  wire [1:0] state,        
+    input  wire [2:0] cursor_pos,   
+    input  wire [31:0] digits_in,   
+    input  wire [31:0] ans_digits,  
+    input  wire overflow_err,       
+    input  wire [2:0] dp_pos,       // 接收動態小數點位置
+    output reg  [7:0] anode, seg_left, seg_right
+);
+    reg [25:0] blink_cnt;
+    wire blink_pulse = blink_cnt[24]; 
+    always @(posedge clk or posedge rst) begin
+        if (rst) blink_cnt <= 26'd0;
+        else blink_cnt <= blink_cnt + 1;
+    end
+
+    reg [16:0] scan_cnt;
+    always @(posedge clk or posedge rst) begin
+        if (rst) scan_cnt <= 17'd0;
+        else scan_cnt <= scan_cnt + 1;
+    end
+    wire [2:0] scan_idx = scan_cnt[16:14];
+
+    function [6:0] decode(input [3:0] digit);
+        begin
+            case(digit)
+                4'h0: decode = 7'b0111111; 4'h1: decode = 7'b0000110;
+                4'h2: decode = 7'b1011011; 4'h3: decode = 7'b1001111;
+                4'h4: decode = 7'b1100110; 4'h5: decode = 7'b1101101;
+                4'h6: decode = 7'b1111101; 4'h7: decode = 7'b0000111;
+                4'h8: decode = 7'b1111111; 4'h9: decode = 7'b1101111;
+                4'hA: decode = 7'b1000000; // '-' 減號
+                4'hB: decode = 7'b0000000; // 空白
+                4'hE: decode = 7'b1111001; // 'E' Error
+                default: decode = 7'b0000000;
+            endcase
+        end
+    endfunction
+
+    wire [31:0] d_in_flat = (state == 2'd2) ? ans_digits : digits_in;
+    reg [3:0] current_digit;
+    reg [6:0] current_seg_7;
+    reg current_dp, is_cursor_active;
+
+    always @(*) begin
+        case(scan_idx)
+            3'd0: current_digit = d_in_flat[31:28];
+            3'd1: current_digit = d_in_flat[27:24];
+            3'd2: current_digit = d_in_flat[23:20];
+            3'd3: current_digit = d_in_flat[19:16];
+            3'd4: current_digit = d_in_flat[15:12];
+            3'd5: current_digit = d_in_flat[11:8];
+            3'd6: current_digit = d_in_flat[7:4];
+            3'd7: current_digit = d_in_flat[3:0];
+        endcase
+
+        if (state == 2'd0 && current_digit == 4'h0 && (scan_idx == 0 || scan_idx == 4)) begin
+            current_seg_7 = 7'b0000000; 
+        end else begin
+            current_seg_7 = decode(current_digit);
+        end
+        
+        is_cursor_active = (state == 2'd0) && (scan_idx == cursor_pos) && blink_pulse;
+
+        current_dp = 1'b0;
+        if (state == 2'd0) begin 
+            if (scan_idx == 2 || scan_idx == 6) current_dp = 1'b1;
+        end else if (state == 2'd2) begin 
+            if (overflow_err) begin
+                if (blink_pulse) current_dp = 1'b1; 
+            end else begin
+                // 💡 動態小數點就在這裡發揮作用！
+                if (scan_idx == dp_pos) current_dp = 1'b1; 
+            end
+        end
+    end
+
+    wire hw_blanking = (scan_cnt[13:12] == 2'b00);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            anode <= 8'd0; seg_left <= 8'd0; seg_right <= 8'd0;
+        end else if (hw_blanking || is_cursor_active) begin
+            anode <= 8'd0; seg_left <= 8'd0; seg_right <= 8'd0; 
+        end else begin
+            anode <= (8'b00000001 << scan_idx); 
+            if (scan_idx < 4) begin
+                seg_left  <= {current_dp, current_seg_7};
+                seg_right <= 8'd0;
+            end else begin
+                seg_left  <= 8'd0;
+                seg_right <= {current_dp, current_seg_7};
+            end
+        end
+    end
+endmodule
+
+// ===================================================================
+// 3. Debounce Module
+// ===================================================================
+module debounce (
+    input  wire clk, rst, btn_in,
+    output wire btn_pulse
+);
+    reg btn_ff1, btn_ff2;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            btn_ff1 <= 1'b0; btn_ff2 <= 1'b0;
+        end else begin
+            btn_ff1 <= btn_in; btn_ff2 <= btn_ff1;
+        end
+    end
+    reg [20:0] count;
+    reg btn_stable, btn_stable_delay; 
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            count <= 21'd0; btn_stable <= 1'b0; btn_stable_delay <= 1'b0;
+        end else begin
+            if (btn_ff2 != btn_stable) begin
+                count <= count + 1'b1;
+                if (count == 21'd2_000_000) begin 
+                    btn_stable <= btn_ff2; count <= 21'd0;
+                end
+            end else count <= 21'd0;
+            btn_stable_delay <= btn_stable;
+        end
+    end
+    assign btn_pulse = btn_stable & (~btn_stable_delay);
+endmodule
+
+// ===================================================================
+// 4. Top Module
+// ===================================================================
+module top (
+    input  wire clk, rst_n,       
+    input  wire btn_left, btn_right, btn_up, btn_down, btn_exec,    
+    input  wire [7:0] sw,    
+    output wire [7:0] anode, seg_left, seg_right
+);
+    wire rst = ~rst_n; 
+    wire pulse_left, pulse_right, pulse_exec, pulse_dec, pulse_inc;
+    
+    debounce d_left  (.clk(clk), .rst(rst), .btn_in(btn_left),  .btn_pulse(pulse_left));
+    debounce d_right (.clk(clk), .rst(rst), .btn_in(btn_right), .btn_pulse(pulse_right));
+    debounce d_up    (.clk(clk), .rst(rst), .btn_in(btn_up),    .btn_pulse(pulse_inc));
+    debounce d_down  (.clk(clk), .rst(rst), .btn_in(btn_down),  .btn_pulse(pulse_dec));
+    debounce d_exec  (.clk(clk), .rst(rst), .btn_in(btn_exec),  .btn_pulse(pulse_exec));
+
+    parameter ST_INPUT = 2'd0, ST_WAIT = 2'd1, ST_RESULT = 2'd2;
+    reg [1:0] state;
+    reg [26:0] delay_cnt;
+    wire delay_done = (delay_cnt >= 27'd50_000_000); 
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= ST_INPUT; delay_cnt <= 27'd0;
+        end else begin
+            case (state)
+                ST_INPUT: begin
+                    if (pulse_exec) state <= ST_WAIT;
+                    delay_cnt <= 27'd0;
+                end
+                ST_WAIT: begin
+                    if (delay_done) state <= ST_RESULT;
+                    else delay_cnt <= delay_cnt + 1;
+                end
+                ST_RESULT: begin
+                    if (pulse_exec) state <= ST_INPUT; 
+                end
+                default: state <= ST_INPUT;
+            endcase
+        end
+    end
+
+    reg [2:0] cursor_pos;
+    reg [3:0] digits [0:7]; 
+    integer i;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cursor_pos <= 3'd1; 
+            for (i=0; i<8; i=i+1) digits[i] <= 4'd0; 
+        end else if (state == ST_INPUT) begin
+            if (pulse_left)  cursor_pos <= cursor_pos - 1;
+            if (pulse_right) cursor_pos <= cursor_pos + 1;
+
+            if (pulse_inc) begin
+                if (cursor_pos == 0 || cursor_pos == 4) begin 
+                    digits[cursor_pos] <= (digits[cursor_pos] == 4'hA) ? 4'h0 : 4'hA;
+                end else begin 
+                    if (digits[cursor_pos] == 9) digits[cursor_pos] <= 0;
+                    else digits[cursor_pos] <= digits[cursor_pos] + 1;
+                end
+            end
+            if (pulse_dec) begin
+                if (cursor_pos == 0 || cursor_pos == 4) begin 
+                    digits[cursor_pos] <= (digits[cursor_pos] == 4'hA) ? 4'h0 : 4'hA;
+                end else begin 
+                    if (digits[cursor_pos] == 0) digits[cursor_pos] <= 9;
+                    else digits[cursor_pos] <= digits[cursor_pos] - 1;
+                end
+            end
+        end
+    end
+
+    wire [31:0] user_input_digits;
+    assign user_input_digits[31:28] = digits[0];
+    assign user_input_digits[27:24] = digits[1];
+    assign user_input_digits[23:20] = digits[2];
+    assign user_input_digits[19:16] = digits[3];
+    assign user_input_digits[15:12] = digits[4];
+    assign user_input_digits[11:8]  = digits[5];
+    assign user_input_digits[7:4]   = digits[6];
+    assign user_input_digits[3:0]   = digits[7];
+    
+    wire [31:0] alu_ans_digits;
+    wire [2:0]  alu_dp_pos;
+    wire alu_overflow;
+    
+    reg start_calc;
+    always @(posedge clk) begin
+        if (state == ST_INPUT && pulse_exec) start_calc <= 1'b1;
+        else start_calc <= 1'b0;
+    end
+
+    alu_core my_alu (
+        .clk(clk), .rst(rst), .start(start_calc), .sw(sw),
+        .digits_in(user_input_digits), .ans_digits(alu_ans_digits),
+        .dp_pos(alu_dp_pos), .overflow(alu_overflow)
+    );
+
+    seg_display disp_unit (
+        .clk(clk), .rst(rst), .state(state), .cursor_pos(cursor_pos),
+        .digits_in(user_input_digits), .ans_digits(alu_ans_digits),
+        .dp_pos(alu_dp_pos), .overflow_err(alu_overflow),
+        .anode(anode), .seg_left(seg_left), .seg_right(seg_right)
+    );
+endmodule
